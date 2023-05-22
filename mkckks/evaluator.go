@@ -114,6 +114,15 @@ func (eval *Evaluator) DropLevel(ct0 *Ciphertext, levels int) {
 // MultByConst multiplies ct0 by the input constant and returns the result in ctOut.
 // The scale of the output element will depend on the scale of the input element and the constant (if the constant
 // needs to be scaled (its rational part is not zero)). The constant can be a uint64, int64, float64 or complex128.
+func (eval *Evaluator) MultByConstNew(ct0 *Ciphertext, constant interface{}) (ctOut *Ciphertext) {
+	ctOut = NewCiphertext(eval.params, ct0.IDSet(), ct0.Level(), ct0.Scale)
+	eval.MultByConst(ct0, constant, ctOut)
+	return
+}
+
+// MultByConst multiplies ct0 by the input constant and returns the result in ctOut.
+// The scale of the output element will depend on the scale of the input element and the constant (if the constant
+// needs to be scaled (its rational part is not zero)). The constant can be a uint64, int64, float64 or complex128.
 func (eval *Evaluator) MultByConst(ct0 *Ciphertext, constant interface{}, ctOut *Ciphertext) {
 
 	var level = utils.MinInt(ct0.Level(), ctOut.Level())
