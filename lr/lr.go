@@ -20,18 +20,22 @@ import (
 )
 
 var (
+	modelID  = "model"
+	clientID = "client"
+
 	numTrain   = 11982
 	numTest    = 1984
 	numFeature = 196
 
-	numIter   = 3
+	numIter   = 5
 	blockSize = 1024
 	gamma     = 1.0 / 1024.0                                                                            // learningRate / blockSize
 	eta       = [6]float64{0.98990102, -0.00006179, -0.28178332, -0.43406071, -0.53107588, -0.00039170} // weight
 
 	// slot: 2^15, batch: 1024*197 => (1024*32) x 6 + (1024*5)
-	numCtPerBatch      = 7
-	numFeaturePerBatch = 32
+	numCtPerBlock      = 7  // 13
+	numFeaturePerBatch = 32 // 16
+	numTestBlock       = 2  // 1024 * 197 + 960 * 197
 
 	c3 = 0.0002
 	c1 = -0.0843
@@ -39,24 +43,6 @@ var (
 
 	// Variables for HE setting
 	numSlot = int(math.Pow(2, 15))
-
-	// change this
-	// PN15QP880 = ckks.ParametersLiteral{
-	// 	LogN:     15,
-	// 	LogSlots: 14,
-	// 	Q: []uint64{ // 50 + 38 * 20
-	// 		0x80000000080001,
-	// 		0x4000170001, 0x40002f0001, 0x3fffe80001,
-	// 		0x4000300001, 0x40003f0001, 0x3fffcf0001,
-	// 		0x4000450001, 0x3fffc10001, 0x40004a0001, 0x3fffb80001,
-	// 		0x3fffb70001, 0x4000510001, 0x3fffb20001, 0x4000540001,
-	// 		0x3fffaf0001, 0x4000560001, 0x4000590001,
-	// 		0x3fff810001, 0x40006b0001, 0x4000720001},
-	// 	P: []uint64{ // 50 * 2
-	// 		0x40000001b0001, 0x4000000270001},
-	// 	Scale: 1 << 38,
-	// 	Sigma: rlwe.DefaultSigma,
-	// }
 
 	PN16QP1761 = ckks.ParametersLiteral{
 		LogN:     16,
@@ -70,7 +56,9 @@ var (
 			0x2000019a0001, 0x1ffffe640001, 0x200001a00001, 0x1ffffe520001,
 			0x200001e80001, 0x1ffffe0c0001, 0x1ffffdee0001, 0x200002480001,
 			0x1ffffdb60001, 0x200002560001},
-		P:     []uint64{0x80000000440001, 0x7fffffffba0001, 0x80000000500001, 0x7fffffffaa0001}, // 4 x 55
+		P: []uint64{0x80000000440001, 0x7fffffffba0001}, // 0x80000000500001,
+
+		// 4 x 55
 		Scale: 1 << 45,
 		Sigma: rlwe.DefaultSigma,
 	}
@@ -94,6 +82,8 @@ type testParams struct {
 }
 
 func main() {
+	fmt.Println()
+	fmt.Println("Reading and Preprocessing Data...")
 	const trainFile = "./data/MNIST_train.csv"
 	const testFile = "./data/MNIST_test.csv"
 	var trainData [][]complex128 // first column is label
@@ -103,12 +93,13 @@ func main() {
 	trainData = normalizeData(trainData)
 	testData = normalizeData(testData)
 
-	// trainData = shuffleData(trainData)
-
 	// Setting for HE
 	fmt.Println()
 	fmt.Println("Setting Parameters...")
 	ckks_params, err := ckks.NewParametersFromLiteral(PN16QP1761)
+	if err != nil {
+		panic(err)
+	}
 	params := mkckks.NewParameters(ckks_params)
 
 	if err != nil {
@@ -116,8 +107,8 @@ func main() {
 	}
 
 	idset := mkrlwe.NewIDSet()
-	id := "user0"
-	idset.Add(id)
+	idset.Add(modelID)
+	idset.Add(clientID)
 
 	var testContext *testParams
 	if testContext, err = genTestParams(params, idset); err != nil {
@@ -135,29 +126,35 @@ func main() {
 		zero_vector[i] = complex(0, 0)
 	}
 	zero_msg.Value = zero_vector
-	W := make([]*mkckks.Ciphertext, numCtPerBatch)
-	V := make([]*mkckks.Ciphertext, numCtPerBatch)
-	for i := 0; i < numCtPerBatch; i++ {
-		W[i] = testContext.encryptor.EncryptMsgNew(zero_msg, testContext.pkSet.GetPublicKey(id))
-		V[i] = testContext.encryptor.EncryptMsgNew(zero_msg, testContext.pkSet.GetPublicKey(id))
+	W := make([]*mkckks.Ciphertext, numCtPerBlock)
+	V := make([]*mkckks.Ciphertext, numCtPerBlock)
+	for i := 0; i < numCtPerBlock; i++ {
+		W[i] = testContext.encryptor.EncryptMsgNew(zero_msg, testContext.pkSet.GetPublicKey(modelID))
+		V[i] = testContext.encryptor.EncryptMsgNew(zero_msg, testContext.pkSet.GetPublicKey(modelID))
 	}
 
 	// Encrypt Train Data
-	Z := make([]*mkckks.Ciphertext, numCtPerBatch)
+	Z := make([][]*mkckks.Ciphertext, numIter)
 	msg := mkckks.NewMessage(testContext.params)
 	msg_vector := make([]complex128, numSlot)
-	for i := 0; i < numCtPerBatch; i++ {
-		for j := 0; j < blockSize; j++ {
-			for k := 0; k < numFeaturePerBatch; k++ {
-				if i*numFeaturePerBatch+k > numFeature {
-					msg_vector[j*numFeaturePerBatch+k] = 0
-				} else {
-					msg_vector[j*numFeaturePerBatch+k] = trainData[j][i*numFeaturePerBatch+k]
+
+	for a := 0; a < numIter; a++ {
+		trainData = shuffleData(trainData)
+		Z[a] = make([]*mkckks.Ciphertext, numCtPerBlock)
+
+		for i := 0; i < numCtPerBlock; i++ {
+			for j := 0; j < blockSize; j++ {
+				for k := 0; k < numFeaturePerBatch; k++ {
+					if i*numFeaturePerBatch+k > numFeature {
+						msg_vector[j*numFeaturePerBatch+k] = 0
+					} else {
+						msg_vector[j*numFeaturePerBatch+k] = trainData[j][i*numFeaturePerBatch+k]
+					}
 				}
 			}
+			msg.Value = msg_vector
+			Z[a][i] = testContext.encryptor.EncryptMsgNew(msg, testContext.pkSet.GetPublicKey(modelID))
 		}
-		msg.Value = msg_vector
-		Z[i] = testContext.encryptor.EncryptMsgNew(msg, testContext.pkSet.GetPublicKey(id))
 	}
 
 	// Prepare Constants
@@ -166,7 +163,14 @@ func main() {
 		msg_vector[i] = complex(c1/c3, 0)
 	}
 	msg.Value = msg_vector
-	constCt := testContext.encryptor.EncryptMsgNew(msg, testContext.pkSet.GetPublicKey(id))
+	constCt := testContext.encryptor.EncryptMsgNew(msg, testContext.pkSet.GetPublicKey(modelID))
+
+	// c0
+	for i := 0; i < numSlot; i++ {
+		msg_vector[i] = complex(c0, 0)
+	}
+	msg.Value = msg_vector
+	constCtc0 := testContext.encryptor.EncryptMsgNew(msg, testContext.pkSet.GetPublicKey(modelID))
 
 	// mask
 	for i := 0; i < numSlot; i++ {
@@ -185,12 +189,14 @@ func main() {
 		fmt.Println()
 		fmt.Println(a, "-th Iteration")
 
-		M := testContext.evaluator.MulRelinNew(Z[0], V[0], testContext.rlkSet)
+		start := time.Now()
+
+		M := testContext.evaluator.MulRelinNew(Z[a][0], V[0], testContext.rlkSet)
 		M = SumColVec(testContext.evaluator, testContext.rlkSet, testContext.rtkSet, M, mask, blockSize, numFeaturePerBatch)
 
-		for i := 1; i < numCtPerBatch; i++ {
+		for i := 1; i < numCtPerBlock; i++ {
 			// M_i = Z_i * V_i
-			tmpM := testContext.evaluator.MulRelinNew(Z[i], V[i], testContext.rlkSet)
+			tmpM := testContext.evaluator.MulRelinNew(Z[a][i], V[i], testContext.rlkSet)
 
 			// M_i = SumColVec(M_i)
 			tmpM = SumColVec(testContext.evaluator, testContext.rlkSet, testContext.rtkSet, tmpM, mask, blockSize, numFeaturePerBatch)
@@ -198,107 +204,162 @@ func main() {
 			// M = Sum(M_i)
 			M = testContext.evaluator.AddNew(M, tmpM)
 		}
-		id := 0
-
-		out := testContext.decryptor.Decrypt(M, testContext.skSet).Value[id]
-		fmt.Println("M: ", real(out))
 
 		// M2 = M * M + c1/c3
 		M2 := testContext.evaluator.MulRelinNew(M, M, testContext.rlkSet)
-		out = testContext.decryptor.Decrypt(M2, testContext.skSet).Value[id]
-		fmt.Println("M*M: ", real(out))
 		M2 = testContext.evaluator.AddNew(M2, constCt)
-		out = testContext.decryptor.Decrypt(M2, testContext.skSet).Value[id]
-		fmt.Println("M2: ", real(out))
 
-		for i := 0; i < numCtPerBatch; i++ {
-			// TODO: Z1 and Z3 can be computed in one pass.
+		for i := 0; i < numCtPerBlock; i++ {
 			// Z1 = gamma * c0 * Z
-			Z1 := testContext.evaluator.MultByConstNew(Z[i], gamma*c0)
+			Z1 := testContext.evaluator.MultByConstNew(Z[a][i], gamma*c0)
 
 			// Z3 = gamma * c3 * Z
-			Z3 := testContext.evaluator.MultByConstNew(Z[i], gamma*c3)
+			Z3 := testContext.evaluator.MultByConstNew(Z[a][i], gamma*c3)
 
 			// M1 = M * Z3
 			M1 := testContext.evaluator.MulRelinNew(M, Z3, testContext.rlkSet)
-			if i == 0 {
-				out := testContext.decryptor.Decrypt(M1, testContext.skSet).Value[id]
-				fmt.Println("M1: ", real(out))
-			}
+
 			// G = M1 * M2 + Z1
 			G := testContext.evaluator.MulRelinNew(M1, M2, testContext.rlkSet)
 			G = testContext.evaluator.AddNew(G, Z1)
-			if i == 0 {
-				out := testContext.decryptor.Decrypt(G, testContext.skSet).Value[id]
-				fmt.Println("G: ", real(out))
-			}
 
 			// newW = V + SumRowVec(G)
 			G = SumRowVec(testContext.evaluator, testContext.rtkSet, G, blockSize, numFeaturePerBatch)
+
 			newW := testContext.evaluator.AddNew(V[i], G)
-			if i == 0 {
-				out := testContext.decryptor.Decrypt(V[i], testContext.skSet).Value[id]
-				fmt.Println("V: ", real(out))
-				out = testContext.decryptor.Decrypt(G, testContext.skSet).Value[id]
-				fmt.Println("SumRowVec G: ", real(out))
-				out = testContext.decryptor.Decrypt(newW, testContext.skSet).Value[id]
-				fmt.Println("new W: ", real(out))
-			}
 
 			// newV = (1 - eta) * newW + eta * W
 			W[i] = testContext.evaluator.MultByConstNew(W[i], eta[a])
 			newV := testContext.evaluator.MultByConstNew(newW, 1-eta[a])
 			newV = testContext.evaluator.AddNew(newV, W[i])
-			if i == 0 {
-				out := testContext.decryptor.Decrypt(newV, testContext.skSet).Value[id]
-				fmt.Println("new V: ", real(out))
-			}
 
 			///////////////////////////// Update //////////////////////////////////
-			W[i] = newW
-			V[i] = newV
+			W[i] = newW.CopyNew()
+			V[i] = newV.CopyNew()
 		}
-
-		// out := testContext.decryptor.Decrypt(W[0], testContext.skSet).Value[:5]
-		// fmt.Println(out)
-
+		end := time.Now()
+		elapsed := end.Sub(start)
+		fmt.Println("Elapsed time(ms): ", elapsed)
 	}
 
-	// Inference in plaintext
+	// Inference in ciphertext
 	fmt.Println()
-	fmt.Println("Inference...")
+	fmt.Println("Encrypting Test Data...")
+	testCt := make([][]*mkckks.Ciphertext, numTestBlock)
+	for n := 0; n < numTestBlock; n++ {
+		testCt[n] = make([]*mkckks.Ciphertext, numCtPerBlock)
+	}
+	outCt := make([]*mkckks.Ciphertext, numTestBlock)
+
+	for n := 0; n < numTestBlock; n++ {
+		for i := 0; i < numCtPerBlock; i++ {
+			for j := 0; j < blockSize; j++ {
+				for k := 0; k < numFeaturePerBatch; k++ {
+					sampleId := n*blockSize + j
+					featureId := i*numFeaturePerBatch + k
+					msgId := j*numFeaturePerBatch + k
+					if featureId == 0 {
+						msg_vector[msgId] = complex(1, 0)
+					} else if featureId > numFeature || sampleId >= numTest {
+						msg_vector[msgId] = 0
+					} else {
+						msg_vector[msgId] = testData[sampleId][featureId]
+					}
+				}
+			}
+			msg.Value = msg_vector
+			testCt[n][i] = testContext.encryptor.EncryptMsgNew(msg, testContext.pkSet.GetPublicKey(clientID))
+		}
+	}
+
+	fmt.Println()
+	fmt.Println("Testing...")
+	start := time.Now()
+	for n := 0; n < numTestBlock; n++ {
+		M := testContext.evaluator.MulRelinNew(testCt[n][0], W[0], testContext.rlkSet)
+		M = SumColVec(testContext.evaluator, testContext.rlkSet, testContext.rtkSet, M, mask, blockSize, numFeaturePerBatch)
+
+		for i := 1; i < numCtPerBlock; i++ {
+			// M_i = Z_i * W_i
+			tmpM := testContext.evaluator.MulRelinNew(testCt[n][i], W[i], testContext.rlkSet)
+
+			// M_i = SumColVec(M_i)
+			tmpM = SumColVec(testContext.evaluator, testContext.rlkSet, testContext.rtkSet, tmpM, mask, blockSize, numFeaturePerBatch)
+
+			// M = Sum(M_i)
+			M = testContext.evaluator.AddNew(M, tmpM)
+		}
+
+		// M1 = -c3 * M
+		M1 := testContext.evaluator.MultByConstNew(M, -c3)
+
+		// M2 = M * M + c1/c3
+		M2 := testContext.evaluator.MulRelinNew(M, M, testContext.rlkSet)
+		M2 = testContext.evaluator.AddNew(M2, constCt)
+
+		// sigmoid = M1 * M2 + c0
+		outCt[n] = testContext.evaluator.MulRelinNew(M1, M2, testContext.rlkSet)
+		outCt[n] = testContext.evaluator.AddNew(outCt[n], constCtc0)
+	}
+	end := time.Now()
+	elapsed := end.Sub(start)
+	fmt.Println("Elapsed time(ms): ", elapsed)
+
+	fmt.Println()
+	fmt.Println("Decrypting Result...")
+	outMsg := make([][]complex128, numTestBlock)
+	for n := 0; n < numTestBlock; n++ {
+		outMsg[n] = testContext.decryptor.Decrypt(outCt[n], testContext.skSet).Value
+	}
+
 	correct := 0
-
-	Wdec := make([][]complex128, numCtPerBatch)
-	for i := 0; i < numCtPerBatch; i++ {
-		Wdec[i] = make([]complex128, 32)
-		Wdec[i] = testContext.decryptor.Decrypt(W[i], testContext.skSet).Value[:32]
-	}
-
-	w := make([]float64, 197)
-	for i := 0; i < 197; i++ {
-		w[i] = real(Wdec[i/32][i%32])
-	}
-
-	for i := 0; i < numTest; i++ {
-		inner_prod := w[0]
-		for j := 1; j <= 196; j++ {
-			inner_prod += w[j] * real(testData[i][j])
-		}
-		sigmoid := -c3*inner_prod*inner_prod*inner_prod - c1*inner_prod + c0
-		if i < 10 {
-			fmt.Println(real(testData[i][0]))
-			fmt.Println(sigmoid)
-		}
-		if sigmoid >= 0.5 && real(testData[i][0]) == 1 {
+	for s := 0; s < numTest; s++ {
+		sigmoid := real(outMsg[s/blockSize][(s%blockSize)*numFeaturePerBatch])
+		if sigmoid >= 0.5 && real(testData[s][0]) == 1 {
 			correct += 1
-		} else if sigmoid < 0.5 && real(testData[i][0]) == 0 {
+		} else if sigmoid < 0.5 && real(testData[s][0]) == 0 {
 			correct += 1
 		}
-
 	}
+	fmt.Println()
 	fmt.Println("Correct: ", correct)
 
+	/*
+		// Inference in plaintext
+		fmt.Println()
+		fmt.Println("Inference...")
+		correct := 0
+
+		Wdec := make([][]complex128, numCtPerBlock)
+		for i := 0; i < numCtPerBlock; i++ {
+			Wdec[i] = make([]complex128, numFeaturePerBatch)
+			Wdec[i] = testContext.decryptor.Decrypt(W[i], testContext.skSet).Value[:numFeaturePerBatch]
+		}
+
+		w := make([]float64, numFeature+1)
+		for i := 0; i < numFeature+1; i++ {
+			w[i] = real(Wdec[i/numFeaturePerBatch][i%numFeaturePerBatch])
+		}
+
+		for i := 0; i < numTest; i++ {
+			inner_prod := w[0]
+			for j := 1; j <= numFeature; j++ {
+				inner_prod += w[j] * real(testData[i][j])
+			}
+			sigmoid := -c3*inner_prod*inner_prod*inner_prod - c1*inner_prod + c0
+			if i < 10 {
+				fmt.Println(real(testData[i][0]))
+				fmt.Println(sigmoid)
+			}
+			if sigmoid >= 0.5 && real(testData[i][0]) == 1 {
+				correct += 1
+			} else if sigmoid < 0.5 && real(testData[i][0]) == 0 {
+				correct += 1
+			}
+
+		}
+		fmt.Println("Correct: ", correct)
+	*/
 	return
 }
 
@@ -464,7 +525,7 @@ func shuffleData(data [][]complex128) [][]complex128 {
 	rand.Seed(time.Now().UnixNano())
 
 	for i := 0; i < len(data); i++ {
-		i_rand := i + rand.Intn(32767)/(32767/(len(data)-i+1))
+		i_rand := rand.Intn(i + 1)
 		data[i], data[i_rand] = data[i_rand], data[i]
 	}
 	return data

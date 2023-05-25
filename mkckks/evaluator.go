@@ -1,14 +1,15 @@
 package mkckks
 
-import "mk-lattigo/mkrlwe"
+import (
+	"errors"
+	"math"
+	"mk-lattigo/mkrlwe"
+	"unsafe"
 
-import "github.com/ldsec/lattigo/v2/ring"
-import "github.com/ldsec/lattigo/v2/ckks"
-import "github.com/ldsec/lattigo/v2/utils"
-
-import "math"
-import "unsafe"
-import "errors"
+	"github.com/ldsec/lattigo/v2/ckks"
+	"github.com/ldsec/lattigo/v2/ring"
+	"github.com/ldsec/lattigo/v2/utils"
+)
 
 type Evaluator struct {
 	params    Parameters
@@ -204,6 +205,7 @@ func (eval *Evaluator) MultByConst(ct0 *Ciphertext, constant interface{}, ctOut 
 	}
 
 	ctOut.Scale = ct0.Scale * scale
+	eval.Rescale(ctOut, eval.params.Scale(), ctOut)
 }
 
 func (eval *Evaluator) evaluateInPlace(c0, c1, ctOut *Ciphertext, evaluate func(int, *ring.Poly, *ring.Poly, *ring.Poly)) {
